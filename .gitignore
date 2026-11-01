@@ -1,0 +1,13 @@
+data/
+AGENTS.md
+src/dummpy.py
+playground/
+.env-diagnostics/
+.installers/
+.tools/
+recur/
+src/summarize_model.py
+src/dummy.py
+.cache/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,10 @@
+torch
+matplotlib
+numpy
+seaborn
+huggingface_hub
+datasets
+pyarrow
+ipykernel
+jupyter
+torchsummary
