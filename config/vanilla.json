@@ -1,8 +1,8 @@
 {
     "name": "vanilla",
-    "d_model": 768,
-    "nhead": 12 ,
-    "dim_feedforward": 2048,
+    "d_model": 512,
+    "nhead": 16 ,
+    "dim_feedforward": 1024,
     "max_seq_len": 2048,
     "vocab_size": 50257,
     "recur_pattern": [[12,1]],
