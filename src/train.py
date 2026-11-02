@@ -482,7 +482,7 @@ def run_training(config, run_dir, log_dir):
                     save_checkpoint(f"step_{state['step']:08d}.pt")
                     periodic = sorted(checkpoints.glob("step_*.pt"))
                     keep = checkpoint_config["keep_last_n"]
-                    for obsolete in periodic[:len(periodic) - keep] if keep else periodic:
+                    for obsolete in periodic[:-keep] if keep else periodic:
                         obsolete.unlink()
 
         if evaluation["eval_at_end"]:

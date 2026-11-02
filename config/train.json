@@ -2,14 +2,14 @@
 {
   "experiment": {
     "experiment_name": "recurrent_L3",
-    "model_config_path": "configs/model_config.json",
-    "seed": 42,
+    "model_config_path": "config/vanilla.json",
+    "seed": 67,
     "output_dir": "runs/"
   },
 
   "data": {
     "train_data_path": "data/train.jsonl",
-    "val_data_path": "data/val.jsonl"
+    "val_data_path": "data/tokenized/valid/valid.jsonl"
   },
 
   "training": {
