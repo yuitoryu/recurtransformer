@@ -27,6 +27,8 @@ class RecurrentTransformer(nn.Module):
                 activation=activation,
                 layer_norm_eps=1e-5,
                 batch_first=True,
+                norm_first=True,
+                device=device
             )
             group = nn.TransformerEncoder(layer, num_layers=num_layers)
 

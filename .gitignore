@@ -1,13 +1,15 @@
 data/
 AGENTS.md
-src/dummpy.py
+src/dummy.py
 playground/
 .env-diagnostics/
 .installers/
 .tools/
 recur/
+src/__pycache__
 src/summarize_model.py
 src/dummy.py
 .cache/
 __pycache__/
 *.py[cod]
+codex/

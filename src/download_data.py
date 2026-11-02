@@ -1,6 +1,7 @@
-"""Download ~2B official GPT-2 tokens to data/train, keeping whole documents.
+"""Download GPT-2-counted tokens to data/train and data/valid, keeping whole documents.
 
 Run from the project root: python -B src/download_data.py
+Defaults: 2B training tokens and 10M validation tokens from separate source shards.
 Only the output Parquet files are written; HTTP buffering stays in memory.
 """
 
@@ -27,18 +28,24 @@ def prefix_rows(counts, budget):
     return rows, int(cumulative[rows - 1]) if rows else 0
 
 
-def download(tokens=2_000_000_000):
-    output = PROJECT_ROOT / "data" / "train"
+def download(tokens=2_000_000_000, split="train", exclude_sources=()):
+    output = PROJECT_ROOT / "data" / split
     output.mkdir(parents=True, exist_ok=True)
     paths = sorted(
         path for path in HfApi().list_repo_files(REPO_ID, repo_type="dataset")
         if path.startswith(SOURCE_PREFIX) and path.endswith(".parquet")
+        and path not in exclude_sources
     )
+    # Validation starts at the other end of the sample and excludes training shards.
+    if split == "valid":
+        paths.reverse()
     fs = HfFileSystem()
+    used_sources = set()
     total_tokens = 0
     total_documents = 0
     next_report = 100_000_000
     for source in paths:
+        used_sources.add(source)
         destination = output / Path(source).name
         # fsspec's readahead cache stores bytes in RAM, with no disk cache.
         with fs.open(
@@ -98,12 +105,19 @@ def download(tokens=2_000_000_000):
         f"{tokens - total_tokens:,} tokens below budget. Output: {output}",
         flush=True,
     )
+    return used_sources
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=2_000_000_000)
+    parser.add_argument("--valid-tokens", type=int, default=10_000_000,
+                        help="validation token budget (default: 10000000; 0 disables validation)")
     args = parser.parse_args()
     if args.tokens <= 0:
         parser.error("--tokens must be positive")
-    download(args.tokens)
+    if args.valid_tokens < 0:
+        parser.error("--valid-tokens must be non-negative")
+    train_sources = download(args.tokens)
+    if args.valid_tokens:
+        download(args.valid_tokens, split="valid", exclude_sources=train_sources)
