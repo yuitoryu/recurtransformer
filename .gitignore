@@ -8,8 +8,9 @@ playground/
 recur/
 src/__pycache__
 src/summarize_model.py
-src/dummy.py
+/runs/
 .cache/
 __pycache__/
 *.py[cod]
 codex/
+/tests/
