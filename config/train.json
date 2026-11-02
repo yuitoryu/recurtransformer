@@ -33,8 +33,7 @@
 
   "evaluation": {
     "eval_interval_steps": 500,
-    "eval_batch_size": 8,
-    "eval_tokens": 2000000,
+    "eval_batch_size": 8, 
     "eval_seed": 1234,
     "eval_at_start": true,
     "eval_at_end": true,

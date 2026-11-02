@@ -2,7 +2,8 @@
 
 Relative paths resolve from the project root. Set checkpoint.resume_from to a
 trusted .pt checkpoint to continue its original training schedule. Logs use
-optimizer steps and token-weighted losses. An interval of zero disables that
+optimizer steps and token-weighted losses. Validation uses the entire prepared
+validation JSONL. An interval of zero disables that
 periodic action; final training metrics are still written. keep_last_n applies
 only to periodic checkpoints, so zero retains none of them.
 torch.compile's default backend additionally requires a C/C++ toolchain.
@@ -11,6 +12,7 @@ torch.compile's default backend additionally requires a C/C++ toolchain.
 import argparse
 from array import array
 from contextlib import nullcontext
+from datetime import datetime
 import json
 import math
 import os
@@ -24,6 +26,10 @@ import traceback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def log(message):
+    print(f"{message} [{datetime.now():%Y-%m-%d %H:%M:%S}]", flush=True)
 
 
 def configure_environment():
@@ -101,7 +107,7 @@ class JsonlDataset:
         self.lengths = array("I")
         skipped = 0
         offset = 0
-        print(f"Indexing {path}", flush=True)
+        log(f"Indexing {path}")
         with path.open("rb") as source:
             for line_number, line in enumerate(source, 1):
                 length = len(json.loads(line))
@@ -116,7 +122,7 @@ class JsonlDataset:
                 offset += len(line)
         if not self.offsets:
             raise ValueError(f"No sequences with at least two tokens in {path}")
-        print(f"Indexed {len(self):,} sequences; skipped {skipped:,} short rows", flush=True)
+        log(f"Indexed {len(self):,} sequences; skipped {skipped:,} short rows")
         self.source = path.open("rb")
 
     def __len__(self):
@@ -153,17 +159,6 @@ def epoch_order(size, seed, epoch):
     return torch.randperm(size, generator=torch.Generator().manual_seed(seed + epoch))
 
 
-def select_validation(dataset, token_budget, seed):
-    selected = []
-    tokens = 0
-    for index in epoch_order(len(dataset), seed, 0).tolist():
-        selected.append(index)
-        tokens += dataset.lengths[index] - 1
-        if tokens >= token_budget:
-            break
-    return selected, tokens
-
-
 def learning_rate_at(step, total_steps, training):
     peak = training["learning_rate"]
     warmup = training["warmup_steps"]
@@ -192,7 +187,7 @@ def summed_loss(model, inputs, targets, device, precision):
                                targets.to(device).reshape(-1), ignore_index=-100, reduction="sum")
 
 
-def evaluate(model, dataset, indices, batch_size, device, precision):
+def evaluate(model, dataset, batch_size, device, precision):
     import torch
 
     was_training = model.training
@@ -201,8 +196,8 @@ def evaluate(model, dataset, indices, batch_size, device, precision):
     tokens = 0
     try:
         with torch.inference_mode():
-            for start in range(0, len(indices), batch_size):
-                sequences = [dataset[i] for i in indices[start:start + batch_size]]
+            for start in range(0, len(dataset), batch_size):
+                sequences = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
                 inputs, targets = collate_sequences(sequences)
                 loss_sum += summed_loss(model, inputs, targets, device, precision).double()
                 tokens += sum(len(sequence) - 1 for sequence in sequences)
@@ -292,8 +287,8 @@ def validate_config(config):
     evaluation = config["evaluation"]
     if evaluation["eval_downstream"]:
         raise ValueError("Downstream evaluation is not implemented; use eval_downstream=false")
-    if evaluation["eval_batch_size"] <= 0 or evaluation["eval_tokens"] <= 0:
-        raise ValueError("eval_batch_size and eval_tokens must be positive")
+    if evaluation["eval_batch_size"] <= 0:
+        raise ValueError("eval_batch_size must be positive")
     for section, key in (("logging", "log_interval_steps"), ("evaluation", "eval_interval_steps"),
                          ("checkpoint", "save_interval_steps"), ("checkpoint", "keep_last_n")):
         if config[section][key] < 0:
@@ -353,7 +348,7 @@ def run_training(config, run_dir, log_dir):
         total_steps = math.ceil(len(train_data) / update_size) * training["num_epochs"]
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, lambda index: learning_rate_at(index + 1, total_steps, training) / training["learning_rate"])
-        val_indices, val_tokens = select_validation(val_data, evaluation["eval_tokens"], evaluation["eval_seed"])
+        val_tokens = sum(val_data.lengths) - len(val_data)
         state = {"epoch": 0, "next_sample": 0, "step": 0, "best_eval_loss": math.inf,
                  "train_history": [], "eval_history": [], "log_loss_sum": 0.0,
                  "log_tokens": 0, "log_samples": 0}
@@ -371,8 +366,8 @@ def run_training(config, run_dir, log_dir):
             scaler.load_state_dict(saved["scaler"])
             state = saved["state"]
             restore_rng(saved["rng"])
-            print(f"Resumed {resume_from}: step={state['step']}, epoch={state['epoch']}, "
-                  f"next_sample={state['next_sample']}", flush=True)
+            log(f"Resumed {resume_from}: step={state['step']}, epoch={state['epoch']}, "
+                f"next_sample={state['next_sample']}")
             write_json(log_dir / f"resume_config_step_{state['step']:08d}.json", config)
         else:
             write_json(log_dir / "train_config.json", config)
@@ -382,10 +377,10 @@ def run_training(config, run_dir, log_dir):
         rewrite_metrics(train_metrics, state["train_history"])
         rewrite_metrics(eval_metrics, state["eval_history"])
         trained_model = torch.compile(model, dynamic=True) if config["system"]["compile_model"] else model
-        print(f"Device={device}, precision={precision}, parameters={sum(p.numel() for p in model.parameters()):,}, "
-              f"updates={total_steps:,}", flush=True)
-        print(f"Validation: {len(val_indices):,} fixed sequences, {val_tokens:,} prediction tokens "
-              f"(budget={evaluation['eval_tokens']:,})", flush=True)
+        log(f"Device={device}, precision={precision}, parameters={sum(p.numel() for p in model.parameters()):,}, "
+            f"updates={total_steps:,}")
+        log(f"Validation: full dataset, {len(val_data):,} sequences, "
+            f"{val_tokens:,} prediction tokens")
 
         def save_checkpoint(filename):
             payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
@@ -394,7 +389,7 @@ def run_training(config, run_dir, log_dir):
                        "model_config": model_config, "total_steps": total_steps,
                        "train_samples": len(train_data)}
             atomic_save(payload, checkpoints / filename)
-            print(f"Checkpoint: {checkpoints / filename}", flush=True)
+            log(f"Checkpoint: {checkpoints / filename}")
 
         def log_training():
             if not state["log_tokens"]:
@@ -407,8 +402,8 @@ def run_training(config, run_dir, log_dir):
                 record["gpu_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
             state["train_history"].append(record)
             append_metric(train_metrics, record)
-            print(f"Train step={record['step']}/{total_steps} epoch={record['epoch']:.4f} "
-                  f"loss={record['loss']:.6f} lr={record['learning_rate']:.6g} tokens={record['tokens']:,}", flush=True)
+            log(f"Train step={record['step']}/{total_steps} epoch={record['epoch']:.4f} "
+                f"loss={record['loss']:.6f} lr={record['learning_rate']:.6g} tokens={record['tokens']:,}")
             state["log_loss_sum"] = 0.0
             state["log_tokens"] = 0
             state["log_samples"] = 0
@@ -416,12 +411,11 @@ def run_training(config, run_dir, log_dir):
         def run_evaluation():
             if state["eval_history"] and state["eval_history"][-1]["step"] == state["step"]:
                 return
-            loss, tokens = evaluate(trained_model, val_data, val_indices,
-                                    evaluation["eval_batch_size"], device, precision)
+            loss, tokens = evaluate(trained_model, val_data, evaluation["eval_batch_size"], device, precision)
             record = {"step": state["step"], "loss": loss, "tokens": tokens}
             state["eval_history"].append(record)
             append_metric(eval_metrics, record)
-            print(f"Eval step={state['step']} loss={loss:.6f} tokens={tokens:,}", flush=True)
+            log(f"Eval step={state['step']} loss={loss:.6f} tokens={tokens:,}")
             if loss < state["best_eval_loss"]:
                 state["best_eval_loss"] = loss
                 if checkpoint_config["save_best"]:
@@ -462,7 +456,7 @@ def run_training(config, run_dir, log_dir):
                     if scaler.get_scale() >= previous_scale:
                         break
                     restore_rng(retry_rng)
-                    print(f"fp16 overflow; retrying update with scale={scaler.get_scale()}", flush=True)
+                    log(f"fp16 overflow; retrying update with scale={scaler.get_scale()}")
 
                 scheduler.step()
                 state["step"] += 1
@@ -490,7 +484,7 @@ def run_training(config, run_dir, log_dir):
         if checkpoint_config["save_last"]:
             save_checkpoint("last.pt")
         plot_losses(state["train_history"], state["eval_history"], output_evaluation / "loss_curve.png")
-        print(f"Complete: {state['step']} optimizer steps in {time.monotonic() - started:.1f}s; results: {run_dir}", flush=True)
+        log(f"Complete: {state['step']} optimizer steps in {time.monotonic() - started:.1f}s; results: {run_dir}")
 
 
 def main(argv=None):
@@ -513,8 +507,8 @@ def main(argv=None):
     log_dir.mkdir(parents=True, exist_ok=True)
     with TerminalLog(log_dir / "terminal.log", config["logging"]["log_to_console"]):
         try:
-            print(f"Training config: {config_path}", flush=True)
-            print(json.dumps(config, ensure_ascii=False, indent=2), flush=True)
+            log(f"Training config: {config_path}")
+            log(json.dumps(config, ensure_ascii=False, indent=2))
             run_training(config, run_dir, log_dir)
         except (Exception, KeyboardInterrupt) as error:
             traceback.print_exc()
