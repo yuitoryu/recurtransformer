@@ -1,6 +1,6 @@
 {
     "name": "vanilla",
-    "d_model": 512,
+    "d_model": 384,
     "nhead": 16 ,
     "dim_feedforward": 1024,
     "max_seq_len": 2048,
