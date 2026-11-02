@@ -1,6 +1,7 @@
 """Tokenize one dataset section into a single JSONL file.
 
 Run from the project root: python -B -m src.tokenization --section train
+Default output: data/tokenized/<section>/<section>.jsonl
 Each document gets an EOS token before being split into unpadded chunks.
 """
 
