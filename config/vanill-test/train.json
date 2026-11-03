@@ -1,0 +1,61 @@
+
+{
+  "experiment": {
+    "experiment_name": "vanilla-test",
+    "seed": 67,
+    "output_dir": "runs/"
+  },
+
+  "data": {
+    "train_data_path": "data/tokenized/train/train.jsonl",
+    "val_data_path": "data/tokenized/valid/valid.jsonl"
+  },
+
+  "training": {
+    "num_epochs": 1,
+    "micro_batch_size": 8,
+    "gradient_accumulation_steps": 16,
+
+    "optimizer": "adamw",
+    "learning_rate": 0.0003,
+    "min_learning_rate": 0.00003,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_eps": 1e-8,
+
+    "lr_scheduler": "cosine",
+    "warmup_steps": 500,
+    "max_grad_norm": 1.0,
+    "precision": "bf16"
+  },
+
+  "evaluation": {
+    "eval_interval_steps": 500,
+    "eval_batch_size": 8, 
+    "eval_seed": 1234,
+    "eval_at_start": true,
+    "eval_at_end": true,
+    "eval_downstream": false
+  },
+
+  "logging": {
+    "log_interval_steps": 20,
+    "log_dir": "logs/",
+    "log_to_console": true,
+    "log_gpu_memory": true
+  },
+
+  "checkpoint": {
+    "save_interval_steps": 2000,
+    "save_best": true,
+    "save_last": true,
+    "keep_last_n": 3,
+    "resume_from": null
+  },
+
+  "system": {
+    "device": "cuda",
+    "compile_model": true
+  }
+}

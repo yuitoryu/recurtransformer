@@ -1,4 +1,7 @@
-"""Train tokenized JSONL: python -B -m src.train --config config/train.json.
+"""Train tokenized JSONL: python -B -m src.train --config config/vanill-test.
+
+The config directory contains train.json and model.json. model.json's use_model
+selects a model class from src.model.
 
 Relative paths resolve from the project root. Set checkpoint.resume_from to a
 trusted .pt checkpoint to continue its original training schedule. Logs use
@@ -313,10 +316,10 @@ def validate_config(config):
             raise ValueError(f"{section}.{key} cannot be negative")
 
 
-def run_training(config, run_dir, log_dir):
+def run_training(config, model_config, run_dir, log_dir):
     import numpy as np
     import torch
-    from .model import RecurrentTransformer
+    from . import model as model_module
 
     validate_config(config)
     experiment = config["experiment"]
@@ -342,13 +345,12 @@ def run_training(config, run_dir, log_dir):
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    with project_path(experiment["model_config_path"]).open(encoding="utf-8") as source:
-        model_config = json.load(source)
+    model_class = getattr(model_module, model_config["use_model"])
     model_args = {key: value for key, value in model_config.items()
-                  if key not in {"name", "use_weighted_from_each_loop", "use_regularizer"}}
+                  if key not in {"name", "use_model", "use_weighted_from_each_loop", "use_regularizer"}}
     # model.py's device argument covers only its layers; move the complete model afterward.
     model_args["device"] = "cpu"
-    model = RecurrentTransformer(**model_args).to(device)
+    model = model_class(**model_args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=training["learning_rate"],
                                  betas=(training["beta1"], training["beta2"]),
                                  eps=training["adam_eps"], weight_decay=training["weight_decay"])
@@ -518,11 +520,15 @@ def run_training(config, run_dir, log_dir):
 def main(argv=None):
     configure_environment()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True, help="training JSON configuration")
+    parser.add_argument("--config", type=Path, required=True,
+                        help="directory containing train.json and model.json")
     args = parser.parse_args(argv)
-    config_path = project_path(args.config)
+    config_dir = project_path(args.config)
+    config_path = config_dir / "train.json"
     with config_path.open(encoding="utf-8") as source:
         config = json.load(source)
+    with (config_dir / "model.json").open(encoding="utf-8") as source:
+        model_config = json.load(source)
     run_dir = project_path(config["experiment"]["output_dir"]) / config["experiment"]["experiment_name"]
     run_dir = run_dir.resolve()
     if not run_dir.is_relative_to(PROJECT_ROOT):
@@ -537,7 +543,7 @@ def main(argv=None):
         try:
             log(f"Training config: {config_path}")
             log(json.dumps(config, ensure_ascii=False, indent=2))
-            run_training(config, run_dir, log_dir)
+            run_training(config, model_config, run_dir, log_dir)
         except (Exception, KeyboardInterrupt) as error:
             traceback.print_exc()
             return 130 if isinstance(error, KeyboardInterrupt) else 1
