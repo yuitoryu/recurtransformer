@@ -11,6 +11,7 @@ torch.compile's default backend additionally requires a C/C++ toolchain.
 
 import argparse
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 import json
@@ -139,18 +140,32 @@ class JsonlDataset:
         self.source.close()
 
 
-def collate_sequences(sequences):
+def collate_sequences(sequences, pin_memory=False):
     import torch
 
     # Right padding cannot affect earlier valid positions under the causal mask.
     width = max(map(len, sequences)) - 1
-    inputs = torch.zeros((len(sequences), width), dtype=torch.long)
-    targets = torch.full_like(inputs, -100)
+    inputs = torch.zeros((len(sequences), width), dtype=torch.long, pin_memory=pin_memory)
+    targets = torch.full(inputs.shape, -100, dtype=torch.long, pin_memory=pin_memory)
     for row, sequence in enumerate(sequences):
         length = len(sequence) - 1
         inputs[row, :length] = torch.tensor(sequence[:-1], dtype=torch.long)
         targets[row, :length] = torch.tensor(sequence[1:], dtype=torch.long)
     return inputs, targets
+
+
+def prepare_window(dataset, indices, batch_size, pin_memory=False):
+    """Group only within one update; use a private file handle for prefetch."""
+    indices = sorted(indices, key=lambda i: dataset.lengths[i], reverse=True)
+    batches = []
+    with dataset.path.open("rb") as source:
+        for start in range(0, len(indices), batch_size):
+            sequences = []
+            for index in indices[start:start + batch_size]:
+                source.seek(dataset.offsets[index])
+                sequences.append(json.loads(source.readline()))
+            batches.append(collate_sequences(sequences, pin_memory=pin_memory))
+    return batches
 
 
 def epoch_order(size, seed, epoch):
@@ -181,10 +196,13 @@ def autocast_context(device, precision):
 def summed_loss(model, inputs, targets, device, precision):
     import torch.nn.functional as F
 
+    # Enqueue both copies before forward; pinned training batches avoid host waits.
+    inputs = inputs.to(device, non_blocking=True)
+    targets = targets.to(device, non_blocking=True)
     with autocast_context(device, precision):
-        logits = model(inputs.to(device))
+        logits = model(inputs)
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
-                               targets.to(device).reshape(-1), ignore_index=-100, reduction="sum")
+                               targets.reshape(-1), ignore_index=-100, reduction="sum")
 
 
 def evaluate(model, dataset, batch_size, device, precision):
@@ -198,7 +216,7 @@ def evaluate(model, dataset, batch_size, device, precision):
         with torch.inference_mode():
             for start in range(0, len(dataset), batch_size):
                 sequences = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
-                inputs, targets = collate_sequences(sequences)
+                inputs, targets = collate_sequences(sequences, pin_memory=device.type == "cuda")
                 loss_sum += summed_loss(model, inputs, targets, device, precision).double()
                 tokens += sum(len(sequence) - 1 for sequence in sequences)
     finally:
@@ -342,7 +360,8 @@ def run_training(config, run_dir, log_dir):
     write_json(log_dir / "model_config.json", model_config)
 
     with JsonlDataset(project_path(config["data"]["train_data_path"]), model.max_seq_len) as train_data, \
-            JsonlDataset(project_path(config["data"]["val_data_path"]), model.max_seq_len) as val_data:
+            JsonlDataset(project_path(config["data"]["val_data_path"]), model.max_seq_len) as val_data, \
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="train-prefetch") as prefetch:
         batch_size = training["micro_batch_size"]
         update_size = batch_size * training["gradient_accumulation_steps"]
         total_steps = math.ceil(len(train_data) / update_size) * training["num_epochs"]
@@ -429,12 +448,21 @@ def run_training(config, run_dir, log_dir):
             epoch = state["epoch"]
             order = epoch_order(len(train_data), seed, epoch)
             model.train()
+            start = state["next_sample"]
+            pending = prefetch.submit(prepare_window, train_data,
+                                      order[start:start + update_size].tolist(), batch_size,
+                                      device.type == "cuda")
             while state["next_sample"] < len(train_data) and state["epoch"] == epoch:
                 start = state["next_sample"]
                 end = min(start + update_size, len(train_data))
                 indices = order[start:end].tolist()
-                batches = [collate_sequences([train_data[i] for i in indices[j:j + batch_size]])
-                           for j in range(0, len(indices), batch_size)]
+                batches = pending.result()
+                # Bound host memory to the current and next update. Prefetch never
+                # advances checkpoint progress or consumes training RNG state.
+                if end < len(train_data):
+                    pending = prefetch.submit(prepare_window, train_data,
+                                              order[end:end + update_size].tolist(), batch_size,
+                                              device.type == "cuda")
                 token_count = sum(train_data.lengths[i] - 1 for i in indices)
                 retry_rng = capture_rng() if scaler.is_enabled() else None
                 while True:
