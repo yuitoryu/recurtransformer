@@ -268,7 +268,7 @@ def plot_losses(train_history, eval_history, destination):
     figure, axis = plt.subplots(figsize=(10, 6))
     for records, label in ((train_history, "Train loss"), (eval_history, "Eval loss")):
         if records:
-            axis.plot([r["step"] for r in records], [r["loss"] for r in records], label=label, marker=".")
+            axis.plot([r["step"] for r in records], [r["loss"] for r in records], label=label)
     axis.set(xlabel="Optimizer step", ylabel="Cross-entropy loss", title="Training and validation loss")
     axis.grid(alpha=0.25)
     axis.legend()
