@@ -4,7 +4,10 @@ The config directory contains train.json and model.json. model.json's use_model
 selects a model class from src.model.
 
 Relative paths resolve from the project root. Set checkpoint.resume_from to a
-trusted .pt checkpoint to continue its original training schedule. Logs use
+trusted .pt checkpoint in the same experiment directory to continue training.
+Full resume requires a checkpoint from this DataLoader-based trainer (version 2).
+DataLoader shuffles each epoch; resume replays its deterministic CPU batches to
+the saved sample cursor. The in-memory dataset uses num_workers=0. Logs use
 optimizer steps and token-weighted losses. Validation uses the entire prepared
 validation JSONL. An interval of zero disables that
 periodic action; final training metrics are still written. keep_last_n applies
@@ -14,10 +17,10 @@ torch.compile's default backend additionally requires a C/C++ toolchain.
 
 import argparse
 from array import array
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 import json
+from itertools import islice
 import math
 import os
 from pathlib import Path
@@ -27,6 +30,7 @@ import tempfile
 import threading
 import time
 import traceback
+import warnings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -103,78 +107,63 @@ class TerminalLog:
 
 
 class JsonlDataset:
-    """Store row offsets and lengths; decode token lists only when requested."""
+    """Load JSONL once into compact in-memory tokens and row offsets."""
 
     def __init__(self, path, max_seq_len):
+        import torch
+
         self.path = path
         self.offsets = array("Q")
         self.lengths = array("I")
+        self.tokens = array("q")
         skipped = 0
-        offset = 0
-        log(f"Indexing {path}")
+        log(f"Loading {path} into memory")
         with path.open("rb") as source:
             for line_number, line in enumerate(source, 1):
-                length = len(json.loads(line))
+                sequence = json.loads(line)
+                length = len(sequence)
                 if length > max_seq_len:
                     raise ValueError(f"{path}:{line_number}: sequence length {length} exceeds "
                                      f"model max_seq_len={max_seq_len}")
                 if length >= 2:
-                    self.offsets.append(offset)
+                    self.offsets.append(len(self.tokens))
                     self.lengths.append(length)
+                    self.tokens.extend(sequence)
                 else:
                     skipped += 1
-                offset += len(line)
         if not self.offsets:
             raise ValueError(f"No sequences with at least two tokens in {path}")
-        log(f"Indexed {len(self):,} sequences; skipped {skipped:,} short rows")
-        self.source = path.open("rb")
+        self.tokens = torch.frombuffer(self.tokens, dtype=torch.int64)
+        log(f"Loaded {len(self):,} sequences, {len(self.tokens):,} tokens into memory; "
+            f"skipped {skipped:,} short rows")
 
     def __len__(self):
         return len(self.offsets)
 
     def __getitem__(self, index):
-        self.source.seek(self.offsets[index])
-        return json.loads(self.source.readline())
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.source.close()
+        start = self.offsets[index]
+        return self.tokens[start:start + self.lengths[index]]
 
 
-def collate_sequences(sequences, pin_memory=False):
+def collate_sequences(sequences):
     import torch
+    from torch.nn.utils.rnn import pad_sequence
 
+    sequences = [torch.as_tensor(sequence, dtype=torch.long) for sequence in sequences]
     # Right padding cannot affect earlier valid positions under the causal mask.
-    width = max(map(len, sequences)) - 1
-    inputs = torch.zeros((len(sequences), width), dtype=torch.long, pin_memory=pin_memory)
-    targets = torch.full(inputs.shape, -100, dtype=torch.long, pin_memory=pin_memory)
-    for row, sequence in enumerate(sequences):
-        length = len(sequence) - 1
-        inputs[row, :length] = torch.tensor(sequence[:-1], dtype=torch.long)
-        targets[row, :length] = torch.tensor(sequence[1:], dtype=torch.long)
+    inputs = pad_sequence([s[:-1] for s in sequences], batch_first=True, padding_value=0)
+    targets = pad_sequence([s[1:] for s in sequences], batch_first=True, padding_value=-100)
     return inputs, targets
 
 
-def prepare_window(dataset, indices, batch_size, pin_memory=False):
-    """Group only within one update; use a private file handle for prefetch."""
-    indices = sorted(indices, key=lambda i: dataset.lengths[i], reverse=True)
-    batches = []
-    with dataset.path.open("rb") as source:
-        for start in range(0, len(indices), batch_size):
-            sequences = []
-            for index in indices[start:start + batch_size]:
-                source.seek(dataset.offsets[index])
-                sequences.append(json.loads(source.readline()))
-            batches.append(collate_sequences(sequences, pin_memory=pin_memory))
-    return batches
-
-
-def epoch_order(size, seed, epoch):
+def make_loader(dataset, batch_size, device, *, shuffle=False, seed=0):
     import torch
+    from torch.utils.data import DataLoader
 
-    return torch.randperm(size, generator=torch.Generator().manual_seed(seed + epoch))
+    # Isolate iterator/sampler randomness from model dropout, including validation.
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      collate_fn=collate_sequences, pin_memory=device.type == "cuda",
+                      generator=torch.Generator().manual_seed(seed), num_workers=0)
 
 
 def learning_rate_at(step, total_steps, training):
@@ -217,11 +206,9 @@ def evaluate(model, dataset, batch_size, device, precision):
     tokens = 0
     try:
         with torch.inference_mode():
-            for start in range(0, len(dataset), batch_size):
-                sequences = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
-                inputs, targets = collate_sequences(sequences, pin_memory=device.type == "cuda")
+            for inputs, targets in make_loader(dataset, batch_size, device):
                 loss_sum += summed_loss(model, inputs, targets, device, precision).double()
-                tokens += sum(len(sequence) - 1 for sequence in sequences)
+                tokens += int((targets != -100).sum())
     finally:
         model.train(was_training)
     return loss_sum.item() / tokens, tokens
@@ -316,6 +303,14 @@ def validate_config(config):
             raise ValueError(f"{section}.{key} cannot be negative")
 
 
+def model_arguments(model_config):
+    # Legacy switches never affected the model; use_model selects weighted blocks.
+    args = {key: value for key, value in model_config.items()
+            if key not in {"name", "use_model", "use_weighted_from_each_loop", "use_regularizer"}}
+    args["device"] = "cpu"
+    return args
+
+
 def run_training(config, model_config, run_dir, log_dir):
     import numpy as np
     import torch
@@ -345,176 +340,181 @@ def run_training(config, model_config, run_dir, log_dir):
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
+    resume_from = checkpoint_config["resume_from"]
+    saved = None
+    if resume_from:
+        resume_path = project_path(resume_from)
+        if resume_path.parent != (run_dir / "checkpoints").resolve():
+            raise ValueError("Full resume must use the original experiment directory")
+        # Python/NumPy RNG states require full unpickling: use trusted checkpoints.
+        saved = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if saved.get("format_version") != 2:
+            raise ValueError("Full resume requires a version 2 DataLoader checkpoint")
+        if (saved["model_config"]["use_model"] != model_config["use_model"]
+                or model_arguments(saved["model_config"]) != model_arguments(model_config)):
+            raise ValueError("Full resume requires the original model configuration")
+    legacy_fields = {"use_weighted_from_each_loop", "use_regularizer"} & model_config.keys()
+    if legacy_fields:
+        warnings.warn(f"Remove unused model config fields: {sorted(legacy_fields)}; "
+                      "use_model selects weighted blocks; no regularizer is applied", stacklevel=2)
     model_class = getattr(model_module, model_config["use_model"])
-    model_args = {key: value for key, value in model_config.items()
-                  if key not in {"name", "use_model", "use_weighted_from_each_loop", "use_regularizer"}}
-    # model.py's device argument covers only its layers; move the complete model afterward.
-    model_args["device"] = "cpu"
-    model = model_class(**model_args).to(device)
+    model = model_class(**model_arguments(model_config)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=training["learning_rate"],
                                  betas=(training["beta1"], training["beta2"]),
                                  eps=training["adam_eps"], weight_decay=training["weight_decay"])
     scaler = torch.amp.GradScaler(device.type, enabled=precision == "fp16")
+    train_data = JsonlDataset(project_path(config["data"]["train_data_path"]), model.max_seq_len)
+    val_data = JsonlDataset(project_path(config["data"]["val_data_path"]), model.max_seq_len)
+    batch_size = training["micro_batch_size"]
+    update_size = batch_size * training["gradient_accumulation_steps"]
+    total_steps = math.ceil(len(train_data) / update_size) * training["num_epochs"]
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda index: learning_rate_at(index + 1, total_steps, training) / training["learning_rate"])
+    val_tokens = sum(val_data.lengths) - len(val_data)
+    state = {"epoch": 0, "next_sample": 0, "step": 0, "best_eval_loss": math.inf,
+             "train_history": [], "eval_history": [], "log_loss_sum": 0.0,
+             "log_tokens": 0, "log_samples": 0}
+    if saved is not None:
+        if (saved["config"]["training"] != training or saved["total_steps"] != total_steps
+                or saved["train_samples"] != len(train_data)
+                or saved["config"]["experiment"]["seed"] != seed):
+            raise ValueError("Full resume requires the original training settings, seed and dataset size")
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        scheduler.load_state_dict(saved["scheduler"])
+        scaler.load_state_dict(saved["scaler"])
+        state = saved["state"]
+        restore_rng(saved["rng"])
+        log(f"Resumed {resume_from}: step={state['step']}, epoch={state['epoch']}, "
+            f"next_sample={state['next_sample']}")
+        write_json(log_dir / f"resume_config_step_{state['step']:08d}.json", config)
+    else:
+        write_json(log_dir / "train_config.json", config)
+
     checkpoints = run_dir / "checkpoints"
     output_evaluation = run_dir / "evaluation"
     checkpoints.mkdir(exist_ok=True)
     output_evaluation.mkdir(exist_ok=True)
     write_json(log_dir / "model_config.json", model_config)
 
-    with JsonlDataset(project_path(config["data"]["train_data_path"]), model.max_seq_len) as train_data, \
-            JsonlDataset(project_path(config["data"]["val_data_path"]), model.max_seq_len) as val_data, \
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="train-prefetch") as prefetch:
-        batch_size = training["micro_batch_size"]
-        update_size = batch_size * training["gradient_accumulation_steps"]
-        total_steps = math.ceil(len(train_data) / update_size) * training["num_epochs"]
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda index: learning_rate_at(index + 1, total_steps, training) / training["learning_rate"])
-        val_tokens = sum(val_data.lengths) - len(val_data)
-        state = {"epoch": 0, "next_sample": 0, "step": 0, "best_eval_loss": math.inf,
-                 "train_history": [], "eval_history": [], "log_loss_sum": 0.0,
-                 "log_tokens": 0, "log_samples": 0}
-        resume_from = checkpoint_config["resume_from"]
-        if resume_from:
-            # Python/NumPy RNG states require full unpickling: use trusted training checkpoints.
-            saved = torch.load(project_path(resume_from), map_location="cpu", weights_only=False)
-            if (saved["config"]["training"] != training or saved["total_steps"] != total_steps
-                    or saved["train_samples"] != len(train_data)
-                    or saved["config"]["experiment"]["seed"] != seed):
-                raise ValueError("Full resume requires the original training settings, seed and dataset size")
-            model.load_state_dict(saved["model"])
-            optimizer.load_state_dict(saved["optimizer"])
-            scheduler.load_state_dict(saved["scheduler"])
-            scaler.load_state_dict(saved["scaler"])
-            state = saved["state"]
-            restore_rng(saved["rng"])
-            log(f"Resumed {resume_from}: step={state['step']}, epoch={state['epoch']}, "
-                f"next_sample={state['next_sample']}")
-            write_json(log_dir / f"resume_config_step_{state['step']:08d}.json", config)
-        else:
-            write_json(log_dir / "train_config.json", config)
+    train_metrics = log_dir / "train_metrics.jsonl"
+    eval_metrics = log_dir / "eval_metrics.jsonl"
+    rewrite_metrics(train_metrics, state["train_history"])
+    rewrite_metrics(eval_metrics, state["eval_history"])
+    trained_model = torch.compile(model, dynamic=True) if config["system"]["compile_model"] else model
+    log(f"Device={device}, precision={precision}, parameters={sum(p.numel() for p in model.parameters()):,}, "
+        f"updates={total_steps:,}")
+    log(f"Validation: full dataset, {len(val_data):,} sequences, "
+        f"{val_tokens:,} prediction tokens")
 
-        train_metrics = log_dir / "train_metrics.jsonl"
-        eval_metrics = log_dir / "eval_metrics.jsonl"
-        rewrite_metrics(train_metrics, state["train_history"])
-        rewrite_metrics(eval_metrics, state["eval_history"])
-        trained_model = torch.compile(model, dynamic=True) if config["system"]["compile_model"] else model
-        log(f"Device={device}, precision={precision}, parameters={sum(p.numel() for p in model.parameters()):,}, "
-            f"updates={total_steps:,}")
-        log(f"Validation: full dataset, {len(val_data):,} sequences, "
-            f"{val_tokens:,} prediction tokens")
+    def save_checkpoint(filename):
+        payload = {"format_version": 2, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                   "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                   "state": state, "rng": capture_rng(), "config": config,
+                   "model_config": model_config, "total_steps": total_steps,
+                   "train_samples": len(train_data)}
+        atomic_save(payload, checkpoints / filename)
+        log(f"Checkpoint: {checkpoints / filename}")
 
-        def save_checkpoint(filename):
-            payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                       "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
-                       "state": state, "rng": capture_rng(), "config": config,
-                       "model_config": model_config, "total_steps": total_steps,
-                       "train_samples": len(train_data)}
-            atomic_save(payload, checkpoints / filename)
-            log(f"Checkpoint: {checkpoints / filename}")
+    def log_training():
+        if not state["log_tokens"]:
+            return
+        record = {"step": state["step"], "epoch": state["epoch"] + state["next_sample"] / len(train_data),
+                  "loss": state["log_loss_sum"] / state["log_tokens"], "learning_rate": last_lr,
+                  "tokens": state["log_tokens"], "samples": state["log_samples"]}
+        if logging["log_gpu_memory"] and device.type == "cuda":
+            record["gpu_allocated_bytes"] = torch.cuda.memory_allocated(device)
+            record["gpu_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+        state["train_history"].append(record)
+        append_metric(train_metrics, record)
+        log(f"Train step={record['step']}/{total_steps} epoch={record['epoch']:.4f} "
+            f"loss={record['loss']:.6f} lr={record['learning_rate']:.6g} tokens={record['tokens']:,}")
+        state["log_loss_sum"] = 0.0
+        state["log_tokens"] = 0
+        state["log_samples"] = 0
 
-        def log_training():
-            if not state["log_tokens"]:
-                return
-            record = {"step": state["step"], "epoch": state["epoch"] + state["next_sample"] / len(train_data),
-                      "loss": state["log_loss_sum"] / state["log_tokens"], "learning_rate": last_lr,
-                      "tokens": state["log_tokens"], "samples": state["log_samples"]}
-            if logging["log_gpu_memory"] and device.type == "cuda":
-                record["gpu_allocated_bytes"] = torch.cuda.memory_allocated(device)
-                record["gpu_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
-            state["train_history"].append(record)
-            append_metric(train_metrics, record)
-            log(f"Train step={record['step']}/{total_steps} epoch={record['epoch']:.4f} "
-                f"loss={record['loss']:.6f} lr={record['learning_rate']:.6g} tokens={record['tokens']:,}")
-            state["log_loss_sum"] = 0.0
-            state["log_tokens"] = 0
-            state["log_samples"] = 0
+    def run_evaluation():
+        if state["eval_history"] and state["eval_history"][-1]["step"] == state["step"]:
+            return
+        loss, tokens = evaluate(trained_model, val_data, evaluation["eval_batch_size"], device, precision)
+        record = {"step": state["step"], "loss": loss, "tokens": tokens}
+        state["eval_history"].append(record)
+        append_metric(eval_metrics, record)
+        log(f"Eval step={state['step']} loss={loss:.6f} tokens={tokens:,}")
+        if loss < state["best_eval_loss"]:
+            state["best_eval_loss"] = loss
+            if checkpoint_config["save_best"]:
+                save_checkpoint("best.pt")
 
-        def run_evaluation():
-            if state["eval_history"] and state["eval_history"][-1]["step"] == state["step"]:
-                return
-            loss, tokens = evaluate(trained_model, val_data, evaluation["eval_batch_size"], device, precision)
-            record = {"step": state["step"], "loss": loss, "tokens": tokens}
-            state["eval_history"].append(record)
-            append_metric(eval_metrics, record)
-            log(f"Eval step={state['step']} loss={loss:.6f} tokens={tokens:,}")
-            if loss < state["best_eval_loss"]:
-                state["best_eval_loss"] = loss
-                if checkpoint_config["save_best"]:
-                    save_checkpoint("best.pt")
+    if evaluation["eval_at_start"] and state["step"] == 0:
+        run_evaluation()
+    started = time.monotonic()
+    last_lr = optimizer.param_groups[0]["lr"]
+    while state["epoch"] < training["num_epochs"]:
+        epoch = state["epoch"]
+        loader = make_loader(train_data, batch_size, device, shuffle=True, seed=seed + epoch)
+        model.train()
+        # Replay only CPU data preparation; model RNG and optimizer state are untouched.
+        iterator = islice(iter(loader), state["next_sample"] // batch_size, None)
+        while batches := list(islice(iterator, training["gradient_accumulation_steps"])):
+            sample_count = sum(inputs.size(0) for inputs, _ in batches)
+            end = state["next_sample"] + sample_count
+            token_count = sum(int((targets != -100).sum()) for _, targets in batches)
+            retry_rng = capture_rng() if scaler.is_enabled() else None
+            for _ in range(32):
+                optimizer.zero_grad(set_to_none=True)
+                window_loss = torch.zeros((), device=device, dtype=torch.float64)
+                for inputs, targets in batches:
+                    loss = summed_loss(trained_model, inputs, targets, device, precision)
+                    window_loss += loss.detach().double()
+                    scaler.scale(loss / token_count).backward()
+                loss_value = window_loss.item()
+                if not math.isfinite(loss_value):
+                    raise FloatingPointError(f"Non-finite training loss at step {state['step'] + 1}")
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), training["max_grad_norm"],
+                                               error_if_nonfinite=not scaler.is_enabled())
+                previous_scale = scaler.get_scale()
+                last_lr = optimizer.param_groups[0]["lr"]
+                scaler.step(optimizer)
+                scaler.update()
+                current_scale = scaler.get_scale()
+                if not math.isfinite(current_scale) or current_scale <= 0:
+                    raise FloatingPointError("FP16 gradient scale became non-finite or zero")
+                if current_scale >= previous_scale:
+                    break
+                restore_rng(retry_rng)
+                log(f"fp16 overflow; retrying update with scale={current_scale}")
+            else:
+                raise FloatingPointError(f"FP16 overflow persisted for 32 attempts at step {state['step'] + 1}")
 
-        if evaluation["eval_at_start"] and state["step"] == 0:
-            run_evaluation()
-        started = time.monotonic()
-        last_lr = optimizer.param_groups[0]["lr"]
-        while state["epoch"] < training["num_epochs"]:
-            epoch = state["epoch"]
-            order = epoch_order(len(train_data), seed, epoch)
-            model.train()
-            start = state["next_sample"]
-            pending = prefetch.submit(prepare_window, train_data,
-                                      order[start:start + update_size].tolist(), batch_size,
-                                      device.type == "cuda")
-            while state["next_sample"] < len(train_data) and state["epoch"] == epoch:
-                start = state["next_sample"]
-                end = min(start + update_size, len(train_data))
-                indices = order[start:end].tolist()
-                batches = pending.result()
-                # Bound host memory to the current and next update. Prefetch never
-                # advances checkpoint progress or consumes training RNG state.
-                if end < len(train_data):
-                    pending = prefetch.submit(prepare_window, train_data,
-                                              order[end:end + update_size].tolist(), batch_size,
-                                              device.type == "cuda")
-                token_count = sum(train_data.lengths[i] - 1 for i in indices)
-                retry_rng = capture_rng() if scaler.is_enabled() else None
-                while True:
-                    optimizer.zero_grad(set_to_none=True)
-                    window_loss = torch.zeros((), device=device, dtype=torch.float64)
-                    for inputs, targets in batches:
-                        loss = summed_loss(trained_model, inputs, targets, device, precision)
-                        window_loss += loss.detach().double()
-                        scaler.scale(loss / token_count).backward()
-                    loss_value = window_loss.item()
-                    if not math.isfinite(loss_value):
-                        raise FloatingPointError(f"Non-finite training loss at step {state['step'] + 1}")
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), training["max_grad_norm"])
-                    previous_scale = scaler.get_scale()
-                    last_lr = optimizer.param_groups[0]["lr"]
-                    scaler.step(optimizer)
-                    scaler.update()
-                    if scaler.get_scale() >= previous_scale:
-                        break
-                    restore_rng(retry_rng)
-                    log(f"fp16 overflow; retrying update with scale={scaler.get_scale()}")
+            scheduler.step()
+            state["step"] += 1
+            state["next_sample"] = end
+            if end == len(train_data):
+                state["epoch"] += 1
+                state["next_sample"] = 0
+            state["log_loss_sum"] += loss_value
+            state["log_tokens"] += token_count
+            state["log_samples"] += sample_count
+            if (logging["log_interval_steps"] and state["step"] % logging["log_interval_steps"] == 0) \
+                    or state["step"] == total_steps:
+                log_training()
+            if evaluation["eval_interval_steps"] and state["step"] % evaluation["eval_interval_steps"] == 0:
+                run_evaluation()
+            if checkpoint_config["save_interval_steps"] and state["step"] % checkpoint_config["save_interval_steps"] == 0:
+                save_checkpoint(f"step_{state['step']:08d}.pt")
+                periodic = sorted(checkpoints.glob("step_*.pt"))
+                keep = checkpoint_config["keep_last_n"]
+                for obsolete in periodic[:-keep] if keep else periodic:
+                    obsolete.unlink()
 
-                scheduler.step()
-                state["step"] += 1
-                state["next_sample"] = end
-                if end == len(train_data):
-                    state["epoch"] += 1
-                    state["next_sample"] = 0
-                state["log_loss_sum"] += loss_value
-                state["log_tokens"] += token_count
-                state["log_samples"] += len(indices)
-                if (logging["log_interval_steps"] and state["step"] % logging["log_interval_steps"] == 0) \
-                        or state["step"] == total_steps:
-                    log_training()
-                if evaluation["eval_interval_steps"] and state["step"] % evaluation["eval_interval_steps"] == 0:
-                    run_evaluation()
-                if checkpoint_config["save_interval_steps"] and state["step"] % checkpoint_config["save_interval_steps"] == 0:
-                    save_checkpoint(f"step_{state['step']:08d}.pt")
-                    periodic = sorted(checkpoints.glob("step_*.pt"))
-                    keep = checkpoint_config["keep_last_n"]
-                    for obsolete in periodic[:-keep] if keep else periodic:
-                        obsolete.unlink()
-
-        if evaluation["eval_at_end"]:
-            run_evaluation()
-        if checkpoint_config["save_last"]:
-            save_checkpoint("last.pt")
-        plot_losses(state["train_history"], state["eval_history"], output_evaluation / "loss_curve.png")
-        log(f"Complete: {state['step']} optimizer steps in {time.monotonic() - started:.1f}s; results: {run_dir}")
+    if evaluation["eval_at_end"]:
+        run_evaluation()
+    if checkpoint_config["save_last"]:
+        save_checkpoint("last.pt")
+    plot_losses(state["train_history"], state["eval_history"], output_evaluation / "loss_curve.png")
+    log(f"Complete: {state['step']} optimizer steps in {time.monotonic() - started:.1f}s; results: {run_dir}")
 
 
 def main(argv=None):
