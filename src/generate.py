@@ -34,6 +34,7 @@ def load_model_and_tokenizer(checkpoint_path, device=None):
     tokenizer = GPT2TokenizerFast.from_pretrained(
         "openai-community/gpt2", cache_dir=str(CACHE_DIR)
     )
+    tokenizer.model_max_length = model.max_seq_len
     return model, tokenizer
 
 
@@ -53,7 +54,8 @@ def generate(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
     if not 1 <= max_seq_len <= model.max_seq_len:
         raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
 
-    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    # Context truncation happens below, so tokenizer length warnings do not apply.
+    token_ids = tokenizer.encode(prompt, add_special_tokens=False, verbose=False)
     if not token_ids:
         token_ids = [tokenizer.eos_token_id]
     tokens = torch.tensor([token_ids], dtype=torch.long, device=next(model.parameters()).device)

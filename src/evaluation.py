@@ -107,7 +107,7 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
     for index, row in tqdm(samples, desc="MMLU", unit="questions"):
         subject = row["subject"]
         prompt = prefixes[subject] + _format_mmlu_example(row)
-        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False, verbose=False))
         output = generate(model, tokenizer, prompt,
                           max_new_tokens=max_new_tokens, temperature=0,
                           max_seq_len=max_seq_len)
@@ -165,7 +165,8 @@ def main(argv=None):
 
     run_dir = project_path(args.run_dir)
     checkpoint = run_dir / "checkpoints" / "best.pt"
-    output_dir = (run_dir / "evaluation" / args.benchmark).resolve()
+    output_dir = (run_dir / "evaluation").resolve()
+    output_name = f"{args.benchmark}_{args.num_fewshot}_shot"
     if not output_dir.is_relative_to(PROJECT_ROOT):
         parser.error("The experiment evaluation directory must be inside the project")
 
@@ -179,10 +180,10 @@ def main(argv=None):
     summary.update(run_dir=str(run_dir), checkpoint=str(checkpoint), model=type(model).__name__,
                    device=str(next(model.parameters()).device))
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as output:
+    with (output_dir / f"{output_name}_predictions.jsonl").open("w", encoding="utf-8") as output:
         for row in result["predictions"]:
             output.write(json.dumps(row, ensure_ascii=False) + "\n")
-    write_json(output_dir / "summary.json", summary)
+    write_json(output_dir / f"{output_name}.json", summary)
     print(f"{args.benchmark} generation: accuracy={summary['accuracy']:.4f}, "
           f"total={summary['total']}, invalid={summary['invalid']}, "
           f"truncated={summary['truncated']}")
