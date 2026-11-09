@@ -1,7 +1,7 @@
 """Evaluate benchmarks using generated answers.
 
 Run from the project root:
-    python -B -m src.evaluation --checkpoint runs/vanilla-test/checkpoints/best.pt \
+    python -B -m src.evaluation --run-dir runs/vanilla-test \
         --benchmark mmlu --num-fewshot 5
 
 Add future benchmarks as evaluation functions and entries in BENCHMARKS.
@@ -9,7 +9,6 @@ Add future benchmarks as evaluation functions and entries in BENCHMARKS.
 
 import argparse
 from collections import defaultdict
-from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -147,22 +146,20 @@ BENCHMARKS = {"mmlu": evaluate_mmlu}
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="mmlu")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True,
+                        help="experiment directory containing checkpoints/best.pt")
     parser.add_argument("--device", help="default: CUDA if available, otherwise CPU")
     parser.add_argument("--num-fewshot", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=4)
     parser.add_argument("--subjects", nargs="+", help="default: all subjects")
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
-    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
 
-    checkpoint = project_path(args.checkpoint)
-    output_dir = project_path(args.output_dir) if args.output_dir is not None else (
-        PROJECT_ROOT / "runs" / "evaluation" / args.benchmark
-        / f"{checkpoint.stem}_{datetime.now():%Y%m%d_%H%M%S_%f}"
-    ).resolve()
+    run_dir = project_path(args.run_dir)
+    checkpoint = run_dir / "checkpoints" / "best.pt"
+    output_dir = (run_dir / "evaluation" / args.benchmark).resolve()
     if not output_dir.is_relative_to(PROJECT_ROOT):
-        parser.error("--output-dir must be inside the project")
+        parser.error("The experiment evaluation directory must be inside the project")
 
     model, tokenizer = load_model_and_tokenizer(checkpoint, device=args.device)
     result = BENCHMARKS[args.benchmark](
@@ -170,7 +167,7 @@ def main(argv=None):
         max_new_tokens=args.max_new_tokens, subjects=args.subjects, limit=args.limit,
     )
     summary = result["summary"]
-    summary.update(checkpoint=str(checkpoint), model=type(model).__name__,
+    summary.update(run_dir=str(run_dir), checkpoint=str(checkpoint), model=type(model).__name__,
                    device=str(next(model.parameters()).device))
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as output:
