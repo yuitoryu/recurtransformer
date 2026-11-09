@@ -4,7 +4,7 @@ Run from the project root:
     python -B -m src.evaluation --run-dir runs/vanilla-test \
         --benchmark mmlu --num-fewshot 5
 
-Print all saved evaluation summaries under runs/ (missing results are null):
+Print an accuracy table under runs/ (missing results are null):
     python -B -m src.evaluation --summary
 
 Add future benchmarks as evaluation functions and entries in BENCHMARKS.
@@ -258,7 +258,7 @@ BENCHMARKS = {
 
 
 def collect_results():
-    """Collect complete summaries per run, including missing benchmark/shot pairs."""
+    """Collect accuracies per run, including missing benchmark/shot pairs."""
     evaluation_names = {
         f"{benchmark}_{shot}_shot"
         for benchmark in BENCHMARKS
@@ -270,7 +270,7 @@ def collect_results():
             continue
         summaries = {}
         for path in sorted((run_dir / "evaluation").glob("*.json")):
-            summaries[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+            summaries[path.stem] = json.loads(path.read_text(encoding="utf-8"))["accuracy"]
         results[run_dir.name] = summaries
         evaluation_names.update(summaries)
     return {
@@ -279,11 +279,34 @@ def collect_results():
     }
 
 
+def print_accuracy_table(results):
+    """Print one model per row and one benchmark/shot pair per column."""
+    if not results:
+        print("No runs found under runs/")
+        return
+    names = list(next(iter(results.values())))
+    headers = ["Model"] + [re.sub(r"_(\d+)_shot$", r" \1-shot", name) for name in names]
+    rows = [
+        [run] + ["null" if accuracies[name] is None else f"{accuracies[name]:.2%}" for name in names]
+        for run, accuracies in results.items()
+    ]
+    widths = [max(len(cell) for cell in column) for column in zip(headers, *rows)]
+
+    def format_row(row):
+        return " | ".join(cell.ljust(width) if index == 0 else cell.rjust(width)
+                          for index, (cell, width) in enumerate(zip(row, widths)))
+
+    print(format_row(headers))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows:
+        print(format_row(row))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--summary", action="store_true",
-                      help="print all saved results under runs/ as JSON; missing results are null")
+                      help="print an accuracy table (percentages) under runs/; missing results are null")
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="mmlu")
     mode.add_argument("--run-dir", type=Path,
                       help="experiment directory containing checkpoints/best.pt")
@@ -296,7 +319,7 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
     args = parser.parse_args(argv)
     if args.summary:
-        print(json.dumps(collect_results(), ensure_ascii=False, indent=2))
+        print_accuracy_table(collect_results())
         return 0
     if args.subjects is not None and args.benchmark != "mmlu":
         parser.error("--subjects is only supported for MMLU")
