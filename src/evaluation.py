@@ -7,12 +7,17 @@ Run from the project root:
 Print an accuracy table under runs/ (missing results are null):
     python -B -m src.evaluation --summary
 
+Export the table to evaluation_summary.csv in the current directory:
+    python -B -m src.evaluation --summary --csv
+    python -B -m src.evaluation --summary --csv results/accuracy.csv
+
 Add future benchmarks as evaluation functions and entries in BENCHMARKS.
 MMLU defaults to 5-shot; other tasks default to 0-shot. LAMBADA is 0-shot only.
 """
 
 import argparse
 from collections import defaultdict
+import csv
 import json
 from pathlib import Path
 import re
@@ -279,17 +284,23 @@ def collect_results():
     }
 
 
-def print_accuracy_table(results):
-    """Print one model per row and one benchmark/shot pair per column."""
-    if not results:
-        print("No runs found under runs/")
-        return
-    names = list(next(iter(results.values())))
+def _accuracy_table(results):
+    """Build shared table cells for terminal and CSV output."""
+    names = list(next(iter(results.values()), {}))
     headers = ["Model"] + [re.sub(r"_(\d+)_shot$", r" \1-shot", name) for name in names]
     rows = [
         [run] + ["null" if accuracies[name] is None else f"{accuracies[name]:.2%}" for name in names]
         for run, accuracies in results.items()
     ]
+    return headers, rows
+
+
+def print_accuracy_table(results):
+    """Print one model per row and one benchmark/shot pair per column."""
+    if not results:
+        print("No runs found under runs/")
+        return
+    headers, rows = _accuracy_table(results)
     widths = [max(len(cell) for cell in column) for column in zip(headers, *rows)]
 
     def format_row(row):
@@ -307,6 +318,9 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--summary", action="store_true",
                       help="print an accuracy table (percentages) under runs/; missing results are null")
+    parser.add_argument("--csv", nargs="?", type=Path, const=Path("evaluation_summary.csv"),
+                        metavar="PATH", help="with --summary, export CSV instead of printing the table; "
+                        "default: ./evaluation_summary.csv (relative to the current directory)")
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="mmlu")
     mode.add_argument("--run-dir", type=Path,
                       help="experiment directory containing checkpoints/best.pt")
@@ -318,8 +332,22 @@ def main(argv=None):
     parser.add_argument("--subjects", nargs="+", help="MMLU only; default: all subjects")
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
     args = parser.parse_args(argv)
+    if args.csv is not None and not args.summary:
+        parser.error("--csv requires --summary")
     if args.summary:
-        print_accuracy_table(collect_results())
+        if args.csv is not None:
+            output_path = args.csv.resolve()
+            if not output_path.is_relative_to(PROJECT_ROOT):
+                parser.error("The CSV output path must be inside the project")
+            headers, rows = _accuracy_table(collect_results())
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", encoding="utf-8-sig", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(headers)
+                writer.writerows(rows)
+            print(f"CSV: {output_path}")
+        else:
+            print_accuracy_table(collect_results())
         return 0
     if args.subjects is not None and args.benchmark != "mmlu":
         parser.error("--subjects is only supported for MMLU")
