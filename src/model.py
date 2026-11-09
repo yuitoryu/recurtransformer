@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 
+from .model_block_attnres import RecurrentTransformerBlockAttnRes
+
 
 class AttentionResidual(nn.Module):
     """Full AttnRes: mix raw branch outputs independently at each token.
