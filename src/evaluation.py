@@ -5,6 +5,7 @@ Run from the project root:
         --benchmark mmlu --num-fewshot 5
 
 Add future benchmarks as evaluation functions and entries in BENCHMARKS.
+MMLU defaults to 5-shot; other tasks default to 0-shot. LAMBADA is 0-shot only.
 """
 
 import argparse
@@ -52,6 +53,50 @@ def _metrics(predictions):
     }
 
 
+def _context_length(model, max_new_tokens, limit, max_seq_len):
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    length = model.max_seq_len if max_seq_len is None else max_seq_len
+    if not 1 <= length <= model.max_seq_len:
+        raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
+    return length
+
+
+def _evaluate_samples(model, tokenizer, samples, benchmark, num_fewshot,
+                      max_new_tokens, limit, max_seq_len):
+    if not samples:
+        raise ValueError("No evaluation questions selected")
+    predictions = []
+    for sample in tqdm(samples, desc=benchmark, unit="questions"):
+        record = sample.copy()
+        labels = record.pop("labels", None)
+        prompt = record["prompt"]
+        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False, verbose=False))
+        output = generate(model, tokenizer, prompt, max_new_tokens=max_new_tokens,
+                          temperature=0, max_seq_len=max_seq_len)
+        if labels is None:  # LAMBADA: exact first-word match, including case/punctuation.
+            words = output.split()
+            prediction = words[0] if words else None
+        else:
+            match = re.match(r"^\s*([A-Z])\b", output, flags=re.IGNORECASE)
+            prediction = match.group(1).upper() if match else None
+            if prediction is not None and prediction not in labels:
+                prediction = None
+        record.update(prompt_tokens=prompt_tokens, raw_output=output, prediction=prediction,
+                      correct=prediction == record["target"], truncated=prompt_tokens > max_seq_len)
+        predictions.append(record)
+    summary = {
+        "benchmark": benchmark, "evaluation": "generation",
+        "num_fewshot": num_fewshot, "max_new_tokens": max_new_tokens,
+        "temperature": 0, "max_seq_len": max_seq_len,
+        "model_max_seq_len": model.max_seq_len, "limit": limit,
+        **_metrics(predictions),
+    }
+    return {"summary": summary, "predictions": predictions}
+
+
 def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
                   subjects=None, limit=None, max_seq_len=None):
     """Return {'summary': ..., 'predictions': ...} for generation-based MMLU.
@@ -65,13 +110,7 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
     """
     if not 0 <= num_fewshot <= 5:
         raise ValueError("num_fewshot must be between 0 and 5")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be positive")
-    if limit is not None and limit <= 0:
-        raise ValueError("limit must be positive")
-    max_seq_len = model.max_seq_len if max_seq_len is None else max_seq_len
-    if not 1 <= max_seq_len <= model.max_seq_len:
-        raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
+    max_seq_len = _context_length(model, max_new_tokens, limit, max_seq_len)
 
     test = _load_mmlu("test")
     selected_subjects = set(subjects) if subjects is not None else set(test["subject"])
@@ -102,51 +141,117 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
             _format_mmlu_example(row, include_answer=True) + "\n\n" for row in examples
         )
 
-    predictions = []
+    samples = [{"index": index, "subject": row["subject"], "labels": "ABCD",
+                "prompt": prefixes[row["subject"]] + _format_mmlu_example(row),
+                "target": "ABCD"[row["answer"]]} for index, row in samples]
+    result = _evaluate_samples(model, tokenizer, samples, "mmlu", num_fewshot,
+                               max_new_tokens, limit, max_seq_len)
     by_subject = defaultdict(list)
-    for index, row in tqdm(samples, desc="MMLU", unit="questions"):
-        subject = row["subject"]
-        prompt = prefixes[subject] + _format_mmlu_example(row)
-        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False, verbose=False))
-        output = generate(model, tokenizer, prompt,
-                          max_new_tokens=max_new_tokens, temperature=0,
-                          max_seq_len=max_seq_len)
-        match = re.match(r"^\s*([ABCD])\b", output, flags=re.IGNORECASE)
-        prediction = match.group(1).upper() if match else None
-        target = "ABCD"[row["answer"]]
-        record = {
-            "index": index,
-            "subject": subject,
-            "prompt": prompt,
-            "prompt_tokens": prompt_tokens,
-            "raw_output": output,
-            "prediction": prediction,
-            "target": target,
-            "correct": prediction == target,
-            "truncated": prompt_tokens > max_seq_len,
-        }
-        predictions.append(record)
-        by_subject[subject].append(record)
-
-    summary = {
-        "benchmark": "mmlu",
-        "evaluation": "generation",
-        "dataset": "cais/mmlu",
-        "split": "test",
-        "num_fewshot": num_fewshot,
-        "max_new_tokens": max_new_tokens,
-        "temperature": 0,
-        "max_seq_len": max_seq_len,
-        "model_max_seq_len": model.max_seq_len,
-        "subjects": sorted(selected_subjects) if subjects is not None else None,
-        "limit": limit,
-        **_metrics(predictions),
-        "per_subject": {subject: _metrics(rows) for subject, rows in sorted(by_subject.items())},
-    }
-    return {"summary": summary, "predictions": predictions}
+    for record in result["predictions"]:
+        by_subject[record["subject"]].append(record)
+    result["summary"].update(
+        dataset="cais/mmlu", split="test", fewshot_split="dev" if num_fewshot else None,
+        subjects=sorted(selected_subjects) if subjects is not None else None,
+        per_subject={subject: _metrics(rows) for subject, rows in sorted(by_subject.items())},
+    )
+    return result
 
 
-BENCHMARKS = {"mmlu": evaluate_mmlu}
+CHOICE_DATASETS = {
+    "piqa": ("baber/piqa", "validation"),
+    "arc_easy": ("allenai/ai2_arc", "test"),
+    "hellaswag": ("Rowan/hellaswag", "validation"),
+    "winogrande": ("allenai/winogrande", "validation"),
+}
+
+
+def _load_local(benchmark):
+    directory = PROJECT_ROOT / "data" / benchmark
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Missing {directory}; run: bash download_benchmarks.sh {benchmark}")
+    return load_from_disk(str(directory))
+
+
+def _choice_example(benchmark, row):
+    if benchmark == "piqa":
+        question, choices, answer = row["goal"], [row["sol1"], row["sol2"]], row["label"]
+    elif benchmark == "arc_easy":
+        question, choices = row["question"], row["choices"]["text"]
+        answer = row["choices"]["label"].index(row["answerKey"])
+    elif benchmark == "hellaswag":
+        question = "Choose the most plausible continuation:\n" + row["ctx"]
+        choices, answer = row["endings"], int(row["label"])
+    else:  # winogrande
+        question = "Fill in the blank:\n" + row["sentence"]
+        choices, answer = [row["option1"], row["option2"]], int(row["answer"]) - 1
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:len(choices)]
+    options = "\n".join(f"{label}. {text}" for label, text in zip(labels, choices))
+    return f"{question.strip()}\n{options}\nAnswer:", labels[answer], labels
+
+
+def _evaluate_choices(benchmark, model, tokenizer, num_fewshot, max_new_tokens, limit, max_seq_len):
+    if num_fewshot < 0:
+        raise ValueError("num_fewshot must be non-negative")
+    max_seq_len = _context_length(model, max_new_tokens, limit, max_seq_len)
+    dataset = _load_local(benchmark)
+    prefix = "Answer each multiple choice question with the option letter.\n\n"
+    if num_fewshot:
+        if num_fewshot > len(dataset["train"]):
+            raise ValueError("num_fewshot exceeds the number of training examples")
+        for index in range(num_fewshot):
+            prompt, target, _ = _choice_example(benchmark, dataset["train"][index])
+            prefix += f"{prompt} {target}\n\n"
+    repo, split = CHOICE_DATASETS[benchmark]
+    rows = dataset[split]
+    count = len(rows) if limit is None else min(limit, len(rows))
+    samples = []
+    for index in range(count):
+        prompt, target, labels = _choice_example(benchmark, rows[index])
+        samples.append({"index": index, "prompt": prefix + prompt, "target": target, "labels": labels})
+    result = _evaluate_samples(model, tokenizer, samples, benchmark, num_fewshot,
+                               max_new_tokens, limit, max_seq_len)
+    result["summary"].update(dataset=repo, split=split,
+                             fewshot_split="train" if num_fewshot else None)
+    return result
+
+
+def evaluate_piqa(model, tokenizer, num_fewshot=0, max_new_tokens=4, limit=None, max_seq_len=None):
+    return _evaluate_choices("piqa", model, tokenizer, num_fewshot, max_new_tokens, limit, max_seq_len)
+
+
+def evaluate_arc_easy(model, tokenizer, num_fewshot=0, max_new_tokens=4, limit=None, max_seq_len=None):
+    return _evaluate_choices("arc_easy", model, tokenizer, num_fewshot, max_new_tokens, limit, max_seq_len)
+
+
+def evaluate_hellaswag(model, tokenizer, num_fewshot=0, max_new_tokens=4, limit=None, max_seq_len=None):
+    return _evaluate_choices("hellaswag", model, tokenizer, num_fewshot, max_new_tokens, limit, max_seq_len)
+
+
+def evaluate_winogrande(model, tokenizer, num_fewshot=0, max_new_tokens=4, limit=None, max_seq_len=None):
+    return _evaluate_choices("winogrande", model, tokenizer, num_fewshot, max_new_tokens, limit, max_seq_len)
+
+
+def evaluate_lambada(model, tokenizer, num_fewshot=0, max_new_tokens=16, limit=None, max_seq_len=None):
+    """Generate the last whitespace-delimited word; preserve target case/punctuation."""
+    if num_fewshot != 0:
+        raise ValueError("LAMBADA supports only num_fewshot=0; its local dataset has no training split")
+    max_seq_len = _context_length(model, max_new_tokens, limit, max_seq_len)
+    rows = _load_local("lambada")["test"]
+    count = len(rows) if limit is None else min(limit, len(rows))
+    samples = []
+    for index in range(count):
+        prompt, target = rows[index]["text"].rstrip().rsplit(None, 1)
+        samples.append({"index": index, "prompt": prompt, "target": target})
+    result = _evaluate_samples(model, tokenizer, samples, "lambada", 0,
+                               max_new_tokens, limit, max_seq_len)
+    result["summary"].update(dataset="EleutherAI/lambada_openai", split="test", fewshot_split=None)
+    return result
+
+
+BENCHMARKS = {
+    "mmlu": evaluate_mmlu, "piqa": evaluate_piqa, "arc_easy": evaluate_arc_easy,
+    "hellaswag": evaluate_hellaswag, "winogrande": evaluate_winogrande, "lambada": evaluate_lambada,
+}
 
 
 def main(argv=None):
@@ -155,27 +260,33 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True,
                         help="experiment directory containing checkpoints/best.pt")
     parser.add_argument("--device", help="default: CUDA if available, otherwise CPU")
-    parser.add_argument("--num-fewshot", type=int, default=5)
-    parser.add_argument("--max-new-tokens", type=int, default=4)
+    parser.add_argument("--num-fewshot", type=int, help="default: 5 for MMLU, 0 otherwise")
+    parser.add_argument("--max-new-tokens", type=int, help="default: 16 for LAMBADA, 4 otherwise")
     parser.add_argument("--max-seq-len", type=int,
                         help="context length; default and upper limit: checkpoint's max_seq_len")
-    parser.add_argument("--subjects", nargs="+", help="default: all subjects")
+    parser.add_argument("--subjects", nargs="+", help="MMLU only; default: all subjects")
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
     args = parser.parse_args(argv)
+    if args.subjects is not None and args.benchmark != "mmlu":
+        parser.error("--subjects is only supported for MMLU")
+    num_fewshot = args.num_fewshot if args.num_fewshot is not None else (5 if args.benchmark == "mmlu" else 0)
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else (16 if args.benchmark == "lambada" else 4)
+    if args.benchmark == "lambada" and num_fewshot != 0:
+        parser.error("LAMBADA supports only --num-fewshot 0")
 
     run_dir = project_path(args.run_dir)
     checkpoint = run_dir / "checkpoints" / "best.pt"
     output_dir = (run_dir / "evaluation").resolve()
-    output_name = f"{args.benchmark}_{args.num_fewshot}_shot"
+    output_name = f"{args.benchmark}_{num_fewshot}_shot"
     if not output_dir.is_relative_to(PROJECT_ROOT):
         parser.error("The experiment evaluation directory must be inside the project")
 
     model, tokenizer = load_model_and_tokenizer(checkpoint, device=args.device)
-    result = BENCHMARKS[args.benchmark](
-        model, tokenizer, num_fewshot=args.num_fewshot,
-        max_new_tokens=args.max_new_tokens, subjects=args.subjects, limit=args.limit,
-        max_seq_len=args.max_seq_len,
-    )
+    options = dict(num_fewshot=num_fewshot, max_new_tokens=max_new_tokens,
+                   limit=args.limit, max_seq_len=args.max_seq_len)
+    if args.benchmark == "mmlu":
+        options["subjects"] = args.subjects
+    result = BENCHMARKS[args.benchmark](model, tokenizer, **options)
     summary = result["summary"]
     summary.update(run_dir=str(run_dir), checkpoint=str(checkpoint), model=type(model).__name__,
                    device=str(next(model.parameters()).device))
