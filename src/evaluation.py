@@ -4,6 +4,9 @@ Run from the project root:
     python -B -m src.evaluation --run-dir runs/vanilla-test \
         --benchmark mmlu --num-fewshot 5
 
+Print all saved evaluation summaries under runs/ (missing results are null):
+    python -B -m src.evaluation --summary
+
 Add future benchmarks as evaluation functions and entries in BENCHMARKS.
 MMLU defaults to 5-shot; other tasks default to 0-shot. LAMBADA is 0-shot only.
 """
@@ -254,11 +257,36 @@ BENCHMARKS = {
 }
 
 
+def collect_results():
+    """Collect complete summaries per run, including missing benchmark/shot pairs."""
+    evaluation_names = {
+        f"{benchmark}_{shot}_shot"
+        for benchmark in BENCHMARKS
+        for shot in ((0,) if benchmark == "lambada" else (0, 5))
+    }
+    results = {}
+    for run_dir in sorted((PROJECT_ROOT / "runs").glob("*")):
+        if not run_dir.is_dir():
+            continue
+        summaries = {}
+        for path in sorted((run_dir / "evaluation").glob("*.json")):
+            summaries[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+        results[run_dir.name] = summaries
+        evaluation_names.update(summaries)
+    return {
+        run: {name: summaries.get(name) for name in sorted(evaluation_names)}
+        for run, summaries in results.items()
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--summary", action="store_true",
+                      help="print all saved results under runs/ as JSON; missing results are null")
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="mmlu")
-    parser.add_argument("--run-dir", type=Path, required=True,
-                        help="experiment directory containing checkpoints/best.pt")
+    mode.add_argument("--run-dir", type=Path,
+                      help="experiment directory containing checkpoints/best.pt")
     parser.add_argument("--device", help="default: CUDA if available, otherwise CPU")
     parser.add_argument("--num-fewshot", type=int, help="default: 5 for MMLU, 0 otherwise")
     parser.add_argument("--max-new-tokens", type=int, help="default: 16 for LAMBADA, 4 otherwise")
@@ -267,6 +295,9 @@ def main(argv=None):
     parser.add_argument("--subjects", nargs="+", help="MMLU only; default: all subjects")
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
     args = parser.parse_args(argv)
+    if args.summary:
+        print(json.dumps(collect_results(), ensure_ascii=False, indent=2))
+        return 0
     if args.subjects is not None and args.benchmark != "mmlu":
         parser.error("--subjects is only supported for MMLU")
     num_fewshot = args.num_fewshot if args.num_fewshot is not None else (5 if args.benchmark == "mmlu" else 0)
