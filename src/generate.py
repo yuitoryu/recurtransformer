@@ -38,15 +38,20 @@ def load_model_and_tokenizer(checkpoint_path, device=None):
 
 
 @torch.inference_mode()
-def generate(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0):
+def generate(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
+             max_seq_len=None):
     """Return only the generated continuation of a single text prompt.
 
     temperature=0 uses greedy decoding; positive values enable sampling.
-    Stop on EOS or max_new_tokens. Each step uses the last model.max_seq_len
-    tokens as context. An empty prompt starts from the tokenizer's EOS token.
+    Stop on EOS or max_new_tokens. Each step uses the last max_seq_len tokens
+    as context (default: the model's limit). This cannot exceed the model's
+    position embedding limit. An empty prompt starts from the EOS token.
     """
     if max_new_tokens < 0 or temperature < 0:
         raise ValueError("max_new_tokens and temperature must be non-negative")
+    max_seq_len = model.max_seq_len if max_seq_len is None else max_seq_len
+    if not 1 <= max_seq_len <= model.max_seq_len:
+        raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
 
     token_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not token_ids:
@@ -57,7 +62,7 @@ def generate(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0):
     model.eval()
     try:
         for _ in range(max_new_tokens):
-            logits = model(tokens[:, -model.max_seq_len:])[:, -1, :]
+            logits = model(tokens[:, -max_seq_len:])[:, -1, :]
             if temperature == 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:

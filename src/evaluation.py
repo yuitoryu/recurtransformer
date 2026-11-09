@@ -53,7 +53,7 @@ def _metrics(predictions):
 
 
 def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
-                  subjects=None, limit=None):
+                  subjects=None, limit=None, max_seq_len=None):
     """Return {'summary': ..., 'predictions': ...} for generation-based MMLU.
 
     subjects is a sequence of subject names, or None for all subjects. limit
@@ -61,6 +61,7 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
     indices and order. Few-shot examples come only from the same subject's dev
     split. Overlong prompts use generate()'s usual left truncation; 'truncated'
     counts initial prompt overflow, not later sliding during generation.
+    max_seq_len optionally limits context to at most the model's window.
     """
     if not 0 <= num_fewshot <= 5:
         raise ValueError("num_fewshot must be between 0 and 5")
@@ -68,6 +69,9 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
         raise ValueError("max_new_tokens must be positive")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    max_seq_len = model.max_seq_len if max_seq_len is None else max_seq_len
+    if not 1 <= max_seq_len <= model.max_seq_len:
+        raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
 
     test = _load_mmlu("test")
     selected_subjects = set(subjects) if subjects is not None else set(test["subject"])
@@ -105,7 +109,8 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
         prompt = prefixes[subject] + _format_mmlu_example(row)
         prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
         output = generate(model, tokenizer, prompt,
-                          max_new_tokens=max_new_tokens, temperature=0)
+                          max_new_tokens=max_new_tokens, temperature=0,
+                          max_seq_len=max_seq_len)
         match = re.match(r"^\s*([ABCD])\b", output, flags=re.IGNORECASE)
         prediction = match.group(1).upper() if match else None
         target = "ABCD"[row["answer"]]
@@ -118,7 +123,7 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
             "prediction": prediction,
             "target": target,
             "correct": prediction == target,
-            "truncated": prompt_tokens > model.max_seq_len,
+            "truncated": prompt_tokens > max_seq_len,
         }
         predictions.append(record)
         by_subject[subject].append(record)
@@ -131,7 +136,8 @@ def evaluate_mmlu(model, tokenizer, num_fewshot=5, max_new_tokens=4,
         "num_fewshot": num_fewshot,
         "max_new_tokens": max_new_tokens,
         "temperature": 0,
-        "max_seq_len": model.max_seq_len,
+        "max_seq_len": max_seq_len,
+        "model_max_seq_len": model.max_seq_len,
         "subjects": sorted(selected_subjects) if subjects is not None else None,
         "limit": limit,
         **_metrics(predictions),
@@ -151,6 +157,8 @@ def main(argv=None):
     parser.add_argument("--device", help="default: CUDA if available, otherwise CPU")
     parser.add_argument("--num-fewshot", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=4)
+    parser.add_argument("--max-seq-len", type=int,
+                        help="context length; default and upper limit: checkpoint's max_seq_len")
     parser.add_argument("--subjects", nargs="+", help="default: all subjects")
     parser.add_argument("--limit", type=int, help="first N questions after subject filtering")
     args = parser.parse_args(argv)
@@ -165,6 +173,7 @@ def main(argv=None):
     result = BENCHMARKS[args.benchmark](
         model, tokenizer, num_fewshot=args.num_fewshot,
         max_new_tokens=args.max_new_tokens, subjects=args.subjects, limit=args.limit,
+        max_seq_len=args.max_seq_len,
     )
     summary = result["summary"]
     summary.update(run_dir=str(run_dir), checkpoint=str(checkpoint), model=type(model).__name__,
