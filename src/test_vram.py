@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 from .train import (configure_environment, project_path, summed_loss,
-                    compile_for_training, capture_rng, restore_rng)
+                    capture_rng, restore_rng)
 
 
 def main(argv=None):
@@ -89,7 +89,11 @@ def main(argv=None):
             eps=training["adam_eps"], weight_decay=training["weight_decay"])
         scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
         stage = "compilation setup"
-        trained_model = compile_for_training(model, system)
+        trained_model = model
+        if system["compile_model"]:
+            from .train import compile_for_training
+
+            trained_model = compile_for_training(model, system)
         # CPU inputs mirror the training loop's copies and avoid persistent GPU batches.
         tokens = torch.randint(model.vocab_size, (batch, length + 1))
         inputs, targets = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
