@@ -8,7 +8,7 @@ Load once and reuse the model/tokenizer across evaluation examples.
 
 import os
 
-from .train import PROJECT_ROOT, configure_environment, project_path
+from .common import PROJECT_ROOT, configure_environment, project_path
 
 
 configure_environment()
@@ -38,6 +38,50 @@ def load_model_and_tokenizer(checkpoint_path, device=None):
     )
     tokenizer.model_max_length = model.max_seq_len
     return model, tokenizer
+
+
+@torch.inference_mode()
+def generate_batch(model, tokenizer, prompts, max_new_tokens=128, temperature=0.0,
+                   max_seq_len=None):
+    """Generate continuations with right padding and per-sample EOS handling."""
+    if max_new_tokens < 0 or temperature < 0:
+        raise ValueError("max_new_tokens and temperature must be non-negative")
+    max_seq_len = model.max_seq_len if max_seq_len is None else max_seq_len
+    if not 1 <= max_seq_len <= model.max_seq_len:
+        raise ValueError(f"max_seq_len must be between 1 and {model.max_seq_len}")
+    device = next(model.parameters()).device
+    contexts = [tokenizer.encode(prompt, add_special_tokens=False, verbose=False)
+                or [tokenizer.eos_token_id] for prompt in prompts]
+    generated = [[] for _ in prompts]
+    active = list(range(len(prompts)))
+    was_training = model.training
+    model.eval()
+    try:
+        for _ in range(max_new_tokens):
+            if not active:
+                break
+            windows = [contexts[i][-max_seq_len:] for i in active]
+            lengths = torch.tensor([len(row) for row in windows], device=device)
+            tokens = torch.zeros((len(active), max(map(len, windows))),
+                                 dtype=torch.long, device=device)
+            for row, window in enumerate(windows):
+                tokens[row, :len(window)] = torch.tensor(window, device=device)
+            logits = model(tokens)[torch.arange(len(active), device=device), lengths - 1]
+            if temperature == 0:
+                next_tokens = logits.argmax(dim=-1)
+            else:
+                next_tokens = torch.multinomial(
+                    torch.softmax(logits.float() / temperature, dim=-1), 1).squeeze(-1)
+            remaining = []
+            for index, token in zip(active, next_tokens.tolist()):
+                if token != tokenizer.eos_token_id:
+                    generated[index].append(token)
+                    contexts[index].append(token)
+                    remaining.append(index)
+            active = remaining
+    finally:
+        model.train(was_training)
+    return [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in generated]
 
 
 @torch.inference_mode()

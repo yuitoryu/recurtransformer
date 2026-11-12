@@ -26,42 +26,16 @@ import os
 from pathlib import Path
 import random
 import sys
-import tempfile
 import threading
 import time
 import traceback
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from .common import PROJECT_ROOT, configure_environment, project_path, write_json
 
 
 def log(message):
     print(f"{message} [{datetime.now():%Y-%m-%d %H:%M:%S}]", flush=True)
-
-
-def configure_environment():
-    """Keep library caches, compiler products and temporary files in the project."""
-    cache = PROJECT_ROOT / ".cache"
-    locations = {
-        "TMPDIR": cache / "tmp", "TMP": cache / "tmp", "TEMP": cache / "tmp",
-        "XDG_CACHE_HOME": cache,
-        "MPLCONFIGDIR": cache / "matplotlib",
-        "TORCH_HOME": cache / "torch",
-        "TORCHINDUCTOR_CACHE_DIR": cache / "torchinductor",
-        "TORCH_EXTENSIONS_DIR": cache / "torch_extensions",
-        "TRITON_CACHE_DIR": cache / "triton",
-        "CUDA_CACHE_PATH": cache / "cuda",
-    }
-    for key, path in locations.items():
-        path.mkdir(parents=True, exist_ok=True)
-        os.environ[key] = str(path)
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    sys.dont_write_bytecode = True
-    tempfile.tempdir = str(locations["TMPDIR"])
-
-
-def project_path(value):
-    return (PROJECT_ROOT / Path(value)).resolve()
 
 
 class TerminalLog:
@@ -256,12 +230,6 @@ def atomic_save(payload, destination):
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(destination)
-
-
-def write_json(path, value):
-    with path.open("w", encoding="utf-8") as output:
-        json.dump(value, output, indent=2, ensure_ascii=False)
-        output.write("\n")
 
 
 def append_metric(path, record):
