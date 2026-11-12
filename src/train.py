@@ -10,6 +10,9 @@ validation JSONL. An interval of zero disables that
 periodic action; final training metrics are still written. keep_last_n applies
 only to periodic checkpoints, so zero retains none of them.
 torch.compile's default backend additionally requires a C/C++ toolchain.
+system.compile_model enables compilation; optional system.compile_mode defaults
+to "full". Use "regional" for layer compilation in RecurrentTransformer and
+RecurrentTransformerW. Compilation happens lazily on first execution.
 """
 
 import argparse
@@ -316,6 +319,36 @@ def validate_config(config):
             raise ValueError(f"{section}.{key} cannot be negative")
 
 
+def compile_for_training(model, system):
+    """Register lazy compilation without changing checkpoint parameter names."""
+    if not system["compile_model"]:
+        log("Compilation disabled")
+        return model
+
+    import torch
+    from .model import RecurrentTransformer, RecurrentTransformerW
+
+    mode = system.get("compile_mode", "full")
+    if mode == "full":
+        trained_model = torch.compile(model, dynamic=True)
+        log("Compilation mode=full; registered for lazy compilation on first forward/backward")
+        return trained_model
+    if mode != "regional":
+        raise ValueError(f"system.compile_mode must be 'full' or 'regional', got {mode!r}")
+    if type(model) not in {RecurrentTransformer, RecurrentTransformerW}:
+        raise ValueError("system.compile_mode='regional' only supports RecurrentTransformer and "
+                         f"RecurrentTransformerW, got {type(model).__name__}; use compile_mode='full'")
+
+    layer_count = 0
+    for module in model.modules():
+        if type(module) is torch.nn.TransformerEncoderLayer:
+            module.compile(dynamic=True)
+            layer_count += 1
+    log(f"Compilation mode=regional, layers={layer_count}; "
+        "registered for lazy compilation on first forward/backward")
+    return model
+
+
 def run_training(config, model_config, run_dir, log_dir):
     import numpy as np
     import torch
@@ -397,7 +430,7 @@ def run_training(config, model_config, run_dir, log_dir):
         eval_metrics = log_dir / "eval_metrics.jsonl"
         rewrite_metrics(train_metrics, state["train_history"])
         rewrite_metrics(eval_metrics, state["eval_history"])
-        trained_model = torch.compile(model, dynamic=True) if config["system"]["compile_model"] else model
+        trained_model = compile_for_training(model, config["system"])
         log(f"Device={device}, precision={precision}, parameters={sum(p.numel() for p in model.parameters()):,}, "
             f"updates={total_steps:,}")
         log(f"Validation: full dataset, {len(val_data):,} sequences, "

@@ -8,7 +8,7 @@ Load once and reuse the model/tokenizer across evaluation examples.
 
 import os
 
-from .train import PROJECT_ROOT, configure_environment, model_arguments, project_path
+from .train import PROJECT_ROOT, configure_environment, project_path
 
 
 configure_environment()
@@ -28,7 +28,9 @@ def load_model_and_tokenizer(checkpoint_path, device=None):
     # Training checkpoints include Python/NumPy RNG state; use trusted project files.
     checkpoint = torch.load(project_path(checkpoint_path), map_location="cpu", weights_only=False)
     config = checkpoint["model_config"]
-    model = getattr(model_module, config["use_model"])(**model_arguments(config))
+    model_args = {key: value for key, value in config.items()
+                  if key not in {"name", "use_model", "use_weighted_from_each_loop", "use_regularizer"}}
+    model = getattr(model_module, config["use_model"])(**model_args)
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     tokenizer = GPT2TokenizerFast.from_pretrained(
